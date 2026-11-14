@@ -1,7 +1,7 @@
 # =============================================================================
-# RPYDict — Ren'Py Embedded SQLite Dictionary (v0.2.2 Lightweight Bubble Edition)
+# RPYDict — Ren'Py Embedded SQLite Dictionary (v0.2.0-alpha)
 # =============================================================================
-# Core Features & Architecture:
+# Core Features (Confirmed Stable):
 # 1. Universal Column Parsing & Full-Row Fallback:
 #    - Uses explicit `builtins.list` / `builtins.dict` to avoid Ren'Py's
 #      `RevertableList` / `RevertableDict` isinstance() trap on `json.loads()`.
@@ -10,33 +10,41 @@
 #    - Preset columns (ipa, pos, definition/meaning/translation, example, synonyms,
 #      points_to/lemma) get styled formatting; any unrecognized or unparsed columns
 #      always fall through to `raw` / `all_columns` so the entire row is displayed.
-#    - Never caches `None` or queries during `renpy.predicting()`.
-# 2. Immersive Direct-Click in Dialogue & Translucent Bubble Popup:
-#    - Hooks `config.say_menu_text_filter` to wrap dialogue words in `{a=rpydict:w}w{/a}`
-#      while skipping existing `{...}` text tags and `[...]` variable interpolations.
-#    - Captures tap/mouse coordinates via `renpy.get_mouse_pos()` to pop up a compact,
-#      narrow (`xmaximum 0.28`, `ymaximum 0.36`), scrollbar-free (`scrollbars None`),
-#      semi-transparent bubble (`#0c1018a8`) directly above the tapped word (or docked
-#      to the right edge, configurable in Setup), with zero full-screen dimming.
-# 3. Minimalist Translucent "D" Corner Trigger:
-#    - Outer trigger reduced to a tiny translucent "D" badge; Setup (`⚙`) is accessed
-#      from inside the `D` sentence panel.
+# 2. Automatic Inflection / Plural Downgrade (`points_to`):
+#    - Fixed a bug where empty JSON `"[]"` or `points_to`/`ipa` in `all_columns`
+#      made pure redirect rows (like plurals/inflections with no own definitions)
+#      appear non-empty and require a manual `see:` click. Now 100% auto-downgrades
+#      to the target lemma whenever an entry has no definitions of its own.
+#    - Enlarged the `see: <lemma>` button (`padding (10, 5)`, `text_size 16`, pill
+#      background) when an entry has both its own senses and a related lemma.
+# 3. Direct Dialogue Click & Translucent Bubble Popup:
+#    - Hooks `config.say_menu_text_filter` to wrap dialogue words in `{a=rpydict:w}w{/a}`.
+#    - Captures tap coordinates via `renpy.get_mouse_pos()` to pop up a narrow,
+#      scrollbar-free, translucent bubble near the tapped word (or docked right).
 #
-# Roadmap / Future Ideas (Recorded as comments Only — Kept Simple for Now):
-# - TODO (Roadmap #1 - Recursive Lookup in Bubble): Tokenize definition text inside
-#   `rpydict_card` into `{a=rpydict:...}` links so clicking words inside a definition
-#   recursively looks them up.
-# - TODO (Roadmap #2 - Gesture Summon): Allow hiding the corner "D" button completely
-#   and summoning the dictionary panel via screen-edge swipe or multi-touch gesture.
-# - TODO (Roadmap #3 - Free Dragging for Trigger): Wrap the corner "D" trigger in a
-#   Ren'Py `drag` displayable and persist `(xpos, ypos)` in `persistent`.
+# Experimental / Under-Observation Features (Marked with [EXPERIMENTAL] in code):
+# - [EXPERIMENTAL #1 - Auto vs Fixed Bubble Height]: `persistent.rpydict_auto_height`
+#   toggles between content-hugging height (`Auto Fit`) and constant height (`Fixed`).
+# - [EXPERIMENTAL #2 - In-Bubble Recursive Lookup & Mini History Stack]: Tapping any
+#   word inside a definition jumps to that word and pushes the previous word onto
+#   `rt().history_stack`, showing a `<- prev_word` back button in the bubble header.
+# - [EXPERIMENTAL #3 - Font Size & Opacity Step Controls]: `[-]` / `[+]` step buttons
+#   in Setup for tweaking font size and bubble opacity without typing numbers.
+#
+# Future Roadmap (Comments Only — Not Implemented Yet):
+# - TODO (Roadmap #1 - Gesture Summon): Hide corner "D" button and summon via gesture.
+# - TODO (Roadmap #2 - Free Dragging for Trigger): Wrap corner "D" in a `drag`.
 # =============================================================================
 
 default persistent.rpydict_dir = None
 default persistent.rpydict_source = None
 default persistent.rpydict_btn_corner = 0
 default persistent.rpydict_inline_mode = True
+default persistent.rpydict_recursive_mode = True
 default persistent.rpydict_right_dock = False
+default persistent.rpydict_auto_height = True
+default persistent.rpydict_font_step = 1
+default persistent.rpydict_alpha_step = 2
 
 init -10 python in _rpydict:
 
@@ -561,9 +569,27 @@ init python in _rpydict:
     import zlib
     import types
 
-    MOD_VERSION = "0.2.2"
+    MOD_VERSION = "0.2.0-alpha"
 
     GENERIC_SCAN_LIMIT = 400000
+
+    # [EXPERIMENTAL #3 - 字号与透明度预设档位调节]
+    # 默认档位为 index=1 ("Default", offset=0)，保持你习惯的基准字号，同时支持在 Setup 中用 - / + 按钮微调。
+    FONT_STEPS = [
+        ("S", -2),
+        ("Default", 0),
+        ("M+", 2),
+        ("L", 4),
+        ("XL", 7),
+    ]
+
+    ALPHA_STEPS = [
+        ("30%", "#0c10184d", "#12141c66"),
+        ("50%", "#0c101880", "#12141c99"),
+        ("65%", "#0c1018a8", "#12141cc0"),
+        ("80%", "#0c1018cc", "#12141ce0"),
+        ("92%", "#0c1018eb", "#12141cf4"),
+    ]
 
     POS_LABELS = {
         1: "noun", 2: "verb", 3: "adj", 4: "adv", 5: "pron",
@@ -652,6 +678,8 @@ init python in _rpydict:
         _m.scan_errors = []
         _m.lookup_cache = {}
         _m.popup_pos = (0.97, 0.42, 1.0, 0.5)
+        _m.current_word = None
+        _m.history_stack = []
         sys.modules["_rpydict_rt"] = _m
         del _m
 
@@ -659,6 +687,8 @@ init python in _rpydict:
         ("scan_errors", []),
         ("last_raw_what", ""),
         ("popup_pos", (0.97, 0.42, 1.0, 0.5)),
+        ("current_word", None),
+        ("history_stack", []),
     ):
         if not hasattr(sys.modules["_rpydict_rt"], _attr):
             setattr(sys.modules["_rpydict_rt"], _attr, _def_val)
@@ -833,6 +863,9 @@ init python in _rpydict:
         return str(obj)
 
     def _decode_cell(val, preset=None):
+        """解码任意单元格，返回 (可读字符串, 解析后的JSON对象或None)。
+        注意：若解压后为空数组 '[]'、空对象 '{}' 或空值，严格返回 (None, None)，
+        防止无词义的复数/变形词把空 '[]' 混入 raw 从而阻塞 points_to 自动降级！"""
         if val is None:
             return None, None
         txt = None
@@ -845,7 +878,7 @@ init python in _rpydict:
         if txt is None:
             return None, None
         txt = txt.strip()
-        if not txt:
+        if not txt or txt in ("[]", "{}", "null", "None"):
             return None, None
         parsed = None
         if (txt.startswith("[") and txt.endswith("]")) or (txt.startswith("{") and txt.endswith("}")):
@@ -854,7 +887,11 @@ init python in _rpydict:
             except Exception:
                 parsed = None
         if parsed is not None:
-            readable = _format_json_readable(parsed) or txt
+            if isinstance(parsed, (_LIST_TYPES, _DICT_TYPES)) and len(parsed) == 0:
+                return None, None
+            readable = _format_json_readable(parsed)
+            if not readable:
+                return None, None
         else:
             readable = txt
         return readable, parsed
@@ -976,7 +1013,7 @@ init python in _rpydict:
                                     "definition": df,
                                     "example": None,
                                     "synonyms": [],
-                                    })
+                                })
         elif txt:
             senses.append({
                 "pos": default_pos,
@@ -1138,8 +1175,6 @@ init python in _rpydict:
                     raw_val = d.get(c)
                     readable, parsed = _decode_cell(raw_val, self.preset)
                     decoded_row[c] = (readable, parsed)
-                    if readable is not None and readable != "" and c != self.word_col:
-                        all_columns.append((c, readable))
 
                 hw_read, _ = decoded_row.get(self.word_col, (None, None))
                 if headword is None and hw_read:
@@ -1180,6 +1215,14 @@ init python in _rpydict:
                     elif role == "synonyms" and not row_syn:
                         row_syn = _coerce_synonyms(parsed if parsed is not None else readable)
                         syn_cols_used.add(c)
+
+                # all_columns 仅收集除词头、读音、跳转指针以外的实质内容列，避免纯跳转词条误判为有内容
+                for c in self.columns:
+                    if c in consumed_cols:
+                        continue
+                    readable, _ = decoded_row.get(c, (None, None))
+                    if readable is not None and readable != "":
+                        all_columns.append((c, readable))
 
                 row_senses = []
                 for c in self.columns:
@@ -1392,8 +1435,15 @@ init python in _rpydict:
                 add(lw[:-3] + "y", 2)
         return out
 
+    def _entry_has_defs(e):
+        return bool(e is not None and (e.get("senses") or e.get("raw")))
+
     def lookup(word):
-        """查询主入口。绝不缓存 None，也不在 screen prediction 阶段查询，防止首次查词被空结果污染。"""
+        """查询主入口：
+        - 当命中的词条自身没有任何词义（如复数/变形词仅含 points_to 跳转指针）时，
+          100% 自动降级直达目标原型词条（支持最多 2 跳链式降级），无需用户再手点一次 see:；
+        - 若原词在库中仅有空壳且无 points_to，还会继续尝试后续词形还原候选词；
+        - 若原词自身有词义且同时带 points_to（如 running），则保留自身词义并在底部显示大号 see: 按钮。"""
         _rt = rt()
         w = (word or "").strip()
         if ":" in w:
@@ -1413,37 +1463,85 @@ init python in _rpydict:
         cands = inflection_candidates(w)
         hits = _rt.adapter.lookup_many(cands)
         entry = None
+        fallback_empty = None
         for c in cands:
             e = hits.get(c.lower())
-            if e is not None:
+            if e is None:
+                continue
+            if _entry_has_defs(e) or e.get("points_to"):
                 entry = e
                 break
+            if fallback_empty is None:
+                fallback_empty = e
+        if entry is None:
+            entry = fallback_empty
+
         if entry is not None:
             entry = builtins.dict(entry)
+            orig_ipa = entry.get("ipa")
+            entry["queried_word"] = w
             entry["lemma"] = None
             entry["redirected"] = False
-            has_content = bool(entry.get("senses") or entry.get("raw"))
-            if not has_content and entry.get("points_to"):
+
+            # 情况 A：当前词条自身无实质释义，但有 points_to 指向原型 → 100% 自动降级（最多追 2 跳）
+            # 降级后直接以目标原型词（如 place）作为主标题与主词条，避免误导用户以为是复数专有释义
+            if not _entry_has_defs(entry) and entry.get("points_to"):
                 pt = entry["points_to"]
-                hop_cands = inflection_candidates(pt)
-                hop_hits = _rt.adapter.lookup_many(hop_cands)
-                hop = None
-                for hc in hop_cands:
-                    hop = hop_hits.get(hc.lower())
-                    if hop is not None:
+                for _hop_idx in range(2):
+                    if not pt:
                         break
-                if hop is not None and (hop.get("senses") or hop.get("raw")):
-                    entry["senses"] = hop.get("senses", [])
-                    entry["raw"] = hop.get("raw", [])
-                    entry["all_columns"] = hop.get("all_columns", [])
-                    entry["ipa"] = entry.get("ipa") or hop.get("ipa")
-                    entry["lemma"] = hop.get("word") or pt
+                    hop_cands = inflection_candidates(pt)
+                    hop_hits = _rt.adapter.lookup_many(hop_cands)
+                    hop = None
+                    for hc in hop_cands:
+                        h = hop_hits.get(hc.lower())
+                        if h is not None:
+                            hop = h
+                            if _entry_has_defs(h):
+                                break
+                    if hop is None:
+                        break
+                    if _entry_has_defs(hop):
+                        target_word = hop.get("word") or pt
+                        entry = builtins.dict(hop)
+                        entry["word"] = target_word
+                        entry["ipa"] = hop.get("ipa") or orig_ipa
+                        entry["queried_word"] = w
+                        entry["redirected"] = True
+                        hop_pt = hop.get("points_to")
+                        if hop_pt and hop_pt.lower() not in (target_word.lower(), key):
+                            entry["lemma"] = hop_pt
+                        else:
+                            entry["lemma"] = None
+                        break
+                    pt = hop.get("points_to")
+
+            # 情况 B：如果 points_to 没救回来且自身仍无释义，尝试 cands 里的后续词形还原候选词
+            if not _entry_has_defs(entry):
+                for c in cands:
+                    e2 = hits.get(c.lower())
+                    if e2 is not None and _entry_has_defs(e2):
+                        target_word = e2.get("word") or c
+                        entry = builtins.dict(e2)
+                        entry["word"] = target_word
+                        entry["ipa"] = e2.get("ipa") or orig_ipa
+                        entry["queried_word"] = w
+                        entry["redirected"] = True
+                        e2_pt = e2.get("points_to")
+                        if e2_pt and e2_pt.lower() not in (target_word.lower(), key):
+                            entry["lemma"] = e2_pt
+                        else:
+                            entry["lemma"] = None
+                        break
+
+            # 情况 C：自身已经有释义（如 running 或带专有复数释义的词条），保留原词标题并在底部提供 see: 按钮
+            if not entry["redirected"]:
+                cur_word = entry.get("word") or w
+                if cur_word.lower() != key:
                     entry["redirected"] = True
-            elif entry.get("points_to"):
-                entry["lemma"] = entry["points_to"]
-            elif entry.get("word") and entry["word"].lower() != key:
-                entry["lemma"] = entry["word"]
-                entry["redirected"] = True
+                pt = entry.get("points_to")
+                if pt and pt.lower() not in (cur_word.lower(), key):
+                    entry["lemma"] = pt
 
             if len(_rt.lookup_cache) > 512:
                 _rt.lookup_cache.clear()
@@ -1451,15 +1549,39 @@ init python in _rpydict:
         return entry
 
     def card_data(word):
-        return lookup(word)
+        e = lookup(word)
+        if e is not None and e.get("word"):
+            rt().current_word = e["word"]
+        return e
+
+    # [EXPERIMENTAL #1 - 气泡高度自适应 vs 固定高度]
+    def needs_scroll(entry):
+        """当开启固定高度模式 (not persistent.rpydict_auto_height) 时，始终返回 True 使用固定高度 viewport；
+        当开启自适应高度 (persistent.rpydict_auto_height) 时，中短词条直接用纯 vbox 紧贴文字高度。"""
+        import store
+        if not getattr(store.persistent, "rpydict_auto_height", True):
+            return True
+        if entry is None:
+            return False
+        senses = entry.get("senses") or []
+        raw = entry.get("raw") or []
+        if len(senses) + len(raw) > 4:
+            return True
+        total_chars = 0
+        for s in senses:
+            total_chars += len(s.get("definition") or "") + len(s.get("example") or "")
+        for _k, v in raw:
+            total_chars += len(v or "")
+        return total_chars > 240
 
 
     # =========================================================================
-    # 原文直点查词过滤器 & 就近气泡坐标计算
+    # 原文直点查词、气泡内轻量递归查词 + 优雅小栈历史记录
     # =========================================================================
 
     _RENPY_TAG_RE = re.compile(r"\{[^{}]*\}")
     _WORD_RE = re.compile(r"[A-Za-z]+(?:['\u2019][A-Za-z]+)*")
+    _SIMPLE_WORD_RE = re.compile(r"[A-Za-z]{2,}(?:['\u2019][A-Za-z]+)*")
     _INLINE_TOKEN_RE = re.compile(
         r"(\{\{|\[\[)"
         r"|(\{a=[^{}]*\}.*?\{/a\})"
@@ -1488,6 +1610,82 @@ init python in _rpydict:
             return m.group(0)
 
         return _INLINE_TOKEN_RE.sub(_repl, text)
+
+    # [EXPERIMENTAL #2 - 气泡内递归查词与轻量历史栈]
+    def link_card_text(s, proto="rpydict_def"):
+        """气泡内部文本的递归查词包装：点击释义中的生词可继续查词，自动压入轻量历史栈。"""
+        import store
+        clean = esc_text(s)
+        if not clean or not getattr(store.persistent, "rpydict_recursive_mode", True):
+            return clean
+
+        def _repl(m):
+            w = m.group(0)
+            return "{a=%s:%s}%s{/a}" % (proto, w, w)
+
+        return _SIMPLE_WORD_RE.sub(_repl, clean)
+
+    def open_word_fresh(word):
+        """从台词或分词栏新打开一个词：清空旧历史栈，将当前词设为栈起点。"""
+        w = (word or "").strip()
+        if ":" in w:
+            w = w.split(":", 1)[1].strip()
+        if not w:
+            return
+        _rt = rt()
+        _rt.history_stack = []
+        _rt.current_word = w
+        sync_card_styles()
+        record_tap_pos()
+        if source_ready():
+            renpy.show_screen("rpydict_card", word=w)
+        else:
+            renpy.show_screen("rpydict_setup")
+        renpy.restart_interaction()
+
+    def jump_word_in_card(word):
+        """在气泡内部点击生词/同义词/关联词跳转：将上一个词压入小栈，支持一键退回。"""
+        w = (word or "").strip()
+        if ":" in w:
+            w = w.split(":", 1)[1].strip()
+        if not w:
+            return
+        _rt = rt()
+        cur = _rt.current_word
+        if cur and cur.lower() != w.lower():
+            if not _rt.history_stack or _rt.history_stack[-1].lower() != cur.lower():
+                _rt.history_stack.append(cur)
+                if len(_rt.history_stack) > 15:
+                    _rt.history_stack.pop(0)
+        _rt.current_word = w
+        sync_card_styles()
+        if source_ready():
+            renpy.show_screen("rpydict_card", word=w)
+            renpy.restart_interaction()
+
+    def pop_word_history():
+        """点击气泡顶部的 <- 按钮退回上一个查过的词。"""
+        _rt = rt()
+        if not _rt.history_stack:
+            return
+        prev_w = _rt.history_stack.pop()
+        _rt.current_word = prev_w
+        sync_card_styles()
+        renpy.show_screen("rpydict_card", word=prev_w)
+        renpy.restart_interaction()
+
+    def prev_history_word():
+        """返回栈顶的上一个词名（无历史时返回 None）。"""
+        st = getattr(rt(), "history_stack", None)
+        return st[-1] if st else None
+
+    def on_inline_word_click(target):
+        open_word_fresh(target)
+        return None
+
+    def on_card_word_click(target):
+        jump_word_in_card(target)
+        return None
 
     def current_sentence():
         import store
@@ -1522,7 +1720,6 @@ init python in _rpydict:
         return rt().tokens
 
     def record_tap_pos():
-        """捕获当前手指/鼠标点击坐标，计算气泡弹出位置 (xpos, ypos, xanchor, yanchor)。"""
         import store
         if getattr(store.persistent, "rpydict_right_dock", False):
             rt().popup_pos = (0.98, 0.38, 1.0, 0.5)
@@ -1536,12 +1733,10 @@ init python in _rpydict:
                 return
             fx = mx / sw
             fy = my / sh
-            # 水平方向：以点击单词为中心，左右留出 0.16 边界防止 0.28 宽度的气泡超出屏幕
             if fx < 0.16:
                 fx = 0.16
             elif fx > 0.84:
                 fx = 0.84
-            # 垂直方向：点底部台词时，气泡底边 (yanchor=1.0) 直接从所点单词正上方弹出
             if fy > 0.42:
                 rt().popup_pos = (fx, max(0.06, fy - 0.045), 0.5, 1.0)
             else:
@@ -1555,20 +1750,61 @@ init python in _rpydict:
             return (0.98, 0.38, 1.0, 0.5)
         return getattr(rt(), "popup_pos", None) or (0.98, 0.38, 1.0, 0.5)
 
-    def on_inline_word_click(target):
-        """点击对话原文本中的单词时：捕获点击坐标并在单词正上方直接弹出轻量半透明气泡。"""
-        w = (target or "").strip()
-        if ":" in w:
-            w = w.split(":", 1)[1].strip()
-        if not w:
-            return None
-        record_tap_pos()
-        if source_ready():
-            renpy.show_screen("rpydict_card", word=w)
-        else:
-            renpy.show_screen("rpydict_setup")
+
+    # =========================================================================
+    # [EXPERIMENTAL #3 - 字号档位与透明度档位调节]
+    # =========================================================================
+
+    def _font_step_idx():
+        import store
+        idx = getattr(store.persistent, "rpydict_font_step", None)
+        if idx is None or not isinstance(idx, int):
+            idx = 1  # 默认 Default 档 (offset=0)
+            store.persistent.rpydict_font_step = idx
+        return max(0, min(len(FONT_STEPS) - 1, idx))
+
+    def font_delta():
+        return FONT_STEPS[_font_step_idx()][1]
+
+    def font_label():
+        return FONT_STEPS[_font_step_idx()][0]
+
+    def step_font(delta):
+        import store
+        store.persistent.rpydict_font_step = max(0, min(len(FONT_STEPS) - 1, _font_step_idx() + delta))
+        sync_card_styles()
         renpy.restart_interaction()
-        return None
+
+    def _alpha_step_idx():
+        import store
+        idx = getattr(store.persistent, "rpydict_alpha_step", None)
+        if idx is None or not isinstance(idx, int):
+            idx = 2  # 默认 65%
+            store.persistent.rpydict_alpha_step = idx
+        return max(0, min(len(ALPHA_STEPS) - 1, idx))
+
+    def alpha_label():
+        return ALPHA_STEPS[_alpha_step_idx()][0]
+
+    def bubble_bg():
+        return ALPHA_STEPS[_alpha_step_idx()][1]
+
+    def tokens_bg():
+        return ALPHA_STEPS[_alpha_step_idx()][2]
+
+    def step_alpha(delta):
+        import store
+        store.persistent.rpydict_alpha_step = max(0, min(len(ALPHA_STEPS) - 1, _alpha_step_idx() + delta))
+        renpy.restart_interaction()
+
+    def sync_card_styles():
+        try:
+            import store
+            d = font_delta()
+            store.style.rpydict_card_def.size = 16 + d
+            store.style.rpydict_card_ex.size = 13 + d
+        except Exception:
+            pass
 
 
     def trigger_visible():
@@ -1600,9 +1836,19 @@ init python in _rpydict:
         store.persistent.rpydict_inline_mode = not bool(store.persistent.rpydict_inline_mode)
         renpy.restart_interaction()
 
+    def toggle_recursive_mode():
+        import store
+        store.persistent.rpydict_recursive_mode = not bool(store.persistent.rpydict_recursive_mode)
+        renpy.restart_interaction()
+
     def toggle_right_dock():
         import store
         store.persistent.rpydict_right_dock = not bool(store.persistent.rpydict_right_dock)
+        renpy.restart_interaction()
+
+    def toggle_auto_height():
+        import store
+        store.persistent.rpydict_auto_height = not bool(store.persistent.rpydict_auto_height)
         renpy.restart_interaction()
 
     def setup_info():
@@ -1707,12 +1953,29 @@ init python in _rpydict:
 style rpydict_inline_word is say_dialogue:
     hover_underline True
 
+style rpydict_card_def is default:
+    color "#f2f6fa"
+    hover_color "#78b4f0"
+    hover_underline True
+    size 16
+
+style rpydict_card_ex is default:
+    color "#a0b0c0"
+    hover_color "#78b4f0"
+    italic True
+    hover_underline True
+    size 13
+
 init 999 python:
+
+    _rpydict.sync_card_styles()
 
     if "rpydict_trigger" not in config.overlay_screens:
         config.overlay_screens.append("rpydict_trigger")
 
     config.hyperlink_handlers["rpydict"] = _rpydict.on_inline_word_click
+    config.hyperlink_handlers["rpydict_def"] = _rpydict.on_card_word_click
+    config.hyperlink_handlers["rpydict_ex"] = _rpydict.on_card_word_click
 
     _rpydict_orig_hl_funcs = style.default.hyperlink_functions
     _rpydict_orig_styler = _rpydict_orig_hl_funcs[0] if _rpydict_orig_hl_funcs else None
@@ -1720,8 +1983,13 @@ init 999 python:
     _rpydict_orig_focus = _rpydict_orig_hl_funcs[2] if (_rpydict_orig_hl_funcs and len(_rpydict_orig_hl_funcs) > 2) else None
 
     def _rpydict_hyperlink_styler(target):
-        if isinstance(target, str) and target.startswith("rpydict:"):
-            return style.rpydict_inline_word
+        if isinstance(target, str):
+            if target.startswith("rpydict:"):
+                return style.rpydict_inline_word
+            if target.startswith("rpydict_def:"):
+                return style.rpydict_card_def
+            if target.startswith("rpydict_ex:"):
+                return style.rpydict_card_ex
         if callable(_rpydict_orig_styler):
             return _rpydict_orig_styler(target)
         return style.hyperlink_text
@@ -1730,6 +1998,11 @@ init 999 python:
     style.default.hyperlink_functions = (_rpydict_hyperlink_styler, _rpydict_orig_clicked, _rpydict_orig_focus)
     try:
         style.say_dialogue.hyperlink_functions = (_rpydict_hyperlink_styler, _rpydict_orig_clicked, _rpydict_orig_focus)
+    except Exception:
+        pass
+    try:
+        style.rpydict_card_def.hyperlink_functions = (_rpydict_hyperlink_styler, _rpydict_orig_clicked, _rpydict_orig_focus)
+        style.rpydict_card_ex.hyperlink_functions = (_rpydict_hyperlink_styler, _rpydict_orig_clicked, _rpydict_orig_focus)
     except Exception:
         pass
 
@@ -1750,15 +2023,69 @@ init 999 python:
 
 
 # =============================================================================
-# 界面层（极简半透明 "D" 触发器 + 无滚动条就近半透明气泡）
+# 界面层（支持历史栈返回、自动降级与大号跳转按钮、高度自适应/固定可切换）
 # =============================================================================
+
+screen rpydict_card_body(_e, _d):
+    if _e is None:
+        text "Not in the dictionary." size (15 + _d) color "#d88888"
+    else:
+        $ _has_senses = bool(_e.get("senses"))
+        $ _has_raw = bool(_e.get("raw"))
+        $ _has_all = bool(_e.get("all_columns"))
+
+        if _has_senses:
+            for _s in _e["senses"]:
+                vbox:
+                    spacing 2
+                    hbox:
+                        spacing 6
+                        yalign 0.0
+                        if _s.get("pos"):
+                            text _rpydict.esc_text(_s["pos"]) substitute False size (12 + _d) color "#78b4f0" yalign 0.15
+                        if _s.get("definition"):
+                            text _rpydict.link_card_text(_s["definition"], "rpydict_def") substitute False size (16 + _d) color "#f2f6fa"
+                    if _s.get("example"):
+                        text _rpydict.link_card_text(_s["example"], "rpydict_ex") substitute False size (13 + _d) color "#a0b0c0" italic True
+                    if _s.get("synonyms"):
+                        hbox:
+                            box_wrap True
+                            spacing 6
+                            text "syn:" size (11 + _d) color "#8090a0" yalign 0.2
+                            for _syn in _s["synonyms"]:
+                                textbutton _rpydict.esc_btn(_syn):
+                                    action Function(_rpydict.jump_word_in_card, _syn)
+                                    background None
+                                    hover_background "#34507066"
+                                    padding (3, 1)
+                                    text_size (12 + _d)
+                                    text_color "#98c0e8"
+                                    text_hover_color "#ffffff"
+
+        if _has_raw:
+            for _rc, _rv in _e["raw"]:
+                hbox:
+                    spacing 6
+                    text _rpydict.esc_text(_rc) substitute False size (12 + _d) color "#78b4f0" yalign 0.15
+                    text _rpydict.link_card_text(_rv, "rpydict_def") substitute False size (15 + _d) color "#eef2f8"
+
+        if not _has_senses and not _has_raw:
+            if _has_all:
+                for _ac, _av in _e["all_columns"]:
+                    hbox:
+                        spacing 6
+                        text _rpydict.esc_text(_ac) substitute False size (12 + _d) color "#78b4f0" yalign 0.15
+                        text _rpydict.link_card_text(_av, "rpydict_def") substitute False size (15 + _d) color "#eef2f8"
+            else:
+                text "No definition found." size (15 + _d) color "#d88888"
+
 
 screen rpydict_trigger():
     zorder 150
     if _rpydict.trigger_visible():
         $ _ta = _rpydict.trigger_align()
-        # TODO (Roadmap #2 - 手势召回): 后续可支持隐藏此按钮，改用屏幕边缘滑动/多指手势唤出查词与设置面板。
-        # TODO (Roadmap #3 - 自由拖动): 后续可将此 frame 包装进 drag 组件并持久化坐标，支持任意拖动位置。
+        # TODO (Roadmap #1 - 手势召回): 后续可支持隐藏此按钮，改用屏幕边缘滑动/多指手势唤出查词与设置面板。
+        # TODO (Roadmap #2 - 自由拖动): 后续可将此 frame 包装进 drag 组件并持久化坐标，支持任意拖动位置。
         frame:
             xalign _ta[0]
             yalign _ta[1]
@@ -1778,7 +2105,6 @@ screen rpydict_trigger():
 screen rpydict_tokens():
     modal True
     zorder 200
-    add "#00000048"
     key "K_ESCAPE" action Hide("rpydict_tokens")
 
     button:
@@ -1787,42 +2113,42 @@ screen rpydict_tokens():
         background None
         action Hide("rpydict_tokens")
 
+    $ _d = _rpydict.font_delta()
+
     frame:
         xalign 0.5
-        yalign 0.25
-        xmaximum 0.88
-        background "#12141cd8"
-        padding (20, 16)
+        yalign 0.28
+        xminimum 240
+        xmaximum 0.58
+        background _rpydict.tokens_bg()
+        padding (18, 14)
         has vbox
         spacing 10
         hbox:
-            xfill True
-            text "LOOK UP A WORD" size 14 color "#8a98a8"
-            hbox:
-                xalign 1.0
-                spacing 14
-                textbutton "⚙" action [Hide("rpydict_tokens"), Show("rpydict_setup")] text_size 17 text_color "#a8c0e0" text_hover_color "#ffffff"
-                textbutton "X" action Hide("rpydict_tokens") text_size 17 text_color "#b0b0b0" text_hover_color "#ffffff"
+            spacing 18
+            text "SENTENCE" size 14 color "#8a98a8" yalign 0.5
+            textbutton "⚙" action [Hide("rpydict_tokens"), Show("rpydict_setup")] text_size 16 text_color "#a8c0e0" text_hover_color "#ffffff"
+            textbutton "X" action Hide("rpydict_tokens") text_size 16 text_color "#b0b0b0" text_hover_color "#ffffff"
 
         if _rpydict.get_tokens():
             hbox:
                 box_wrap True
-                box_wrap_spacing 12
-                spacing 8
-                xfill True
+                box_wrap_spacing 8
+                spacing 6
                 for _t in _rpydict.get_tokens():
                     if _t[1]:
                         textbutton _rpydict.esc_btn(_t[0]):
-                            action [Function(_rpydict.record_tap_pos), Show("rpydict_card", word=_t[0])]
+                            action Function(_rpydict.open_word_fresh, _t[0])
                             background None
                             hover_background "#34507066"
-                            text_size 22
-                            text_color "#e8e8e8"
-                            text_hover_color "#ffffff"
+                            padding (3, 1)
+                            text_size (20 + _d)
+                            text_color "#f0f4f8"
+                            text_hover_color "#78b4f0"
                     else:
-                        text _rpydict.esc_text(_t[0]) substitute False size 22 color "#9a9a9a"
+                        text _rpydict.esc_text(_t[0]) substitute False size (20 + _d) color "#9098a8"
         else:
-            text "No sentence to look up right now." size 18 color "#9a9a9a"
+            text "No sentence to look up right now." size (16 + _d) color "#9a9a9a"
 
 
 screen rpydict_card(word):
@@ -1830,7 +2156,6 @@ screen rpydict_card(word):
     zorder 300
     key "K_ESCAPE" action Hide("rpydict_card")
 
-    # 全屏全透明点击退出层：不给画面加任何黑幕遮罩，点气泡外任意一处即刻关闭气泡
     button:
         xfill True
         yfill True
@@ -1839,9 +2164,10 @@ screen rpydict_card(word):
 
     $ _e = _rpydict.card_data(word)
     $ _pos = _rpydict.get_popup_pos()
+    $ _d = _rpydict.font_delta()
+    $ _scroll = _rpydict.needs_scroll(_e)
+    $ _prev_w = _rpydict.prev_history_word()
 
-    # 轻量半透明窄气泡：默认从点击单词正上方弹出（或贴右侧边缘），宽度限制约 1/4 屏宽，无常驻滚动条
-    # TODO (Roadmap #1 - 递归查词): 后续可将气泡内的英文释义也做词化（Tokenize），支持在气泡内继续点击生词递归查词。
     frame:
         xpos _pos[0]
         ypos _pos[1]
@@ -1849,90 +2175,60 @@ screen rpydict_card(word):
         yanchor _pos[3]
         xminimum 180
         xmaximum 0.27
-        background "#0c1018a8"
+        background _rpydict.bubble_bg()
         padding (14, 10)
         has vbox
         spacing 5
 
+        # [EXPERIMENTAL #2 - 轻量历史栈返回按钮]：当在气泡内做过递归跳转时，顶部显示 <- 上一词 按钮
+        if _prev_w:
+            textbutton ("<- " + _rpydict.esc_btn(_prev_w)):
+                action Function(_rpydict.pop_word_history)
+                background "#22344acc"
+                hover_background "#345478ee"
+                padding (8, 3)
+                text_size (13 + _d)
+                text_color "#98c8ff"
+                text_hover_color "#ffffff"
+
         hbox:
             spacing 8
-            text _rpydict.esc_text(_e["word"] if _e is not None else word) substitute False size 20 bold True color "#ffffff"
+            # 主标题直接展示词典中实际命中的词条名（如复数 places 降级后直接展示 place）
+            text _rpydict.esc_text(_e["word"] if _e is not None else word) substitute False size (20 + _d) bold True color "#ffffff"
 
             if _e is not None and _e.get("ipa"):
-                text _rpydict.esc_text(_e["ipa"]) substitute False font "DejaVuSans.ttf" size 14 color "#98c0f0" yalign 0.6
+                text _rpydict.esc_text(_e["ipa"]) substitute False font "DejaVuSans.ttf" size (14 + _d) color "#98c0f0" yalign 0.6
 
-        if _e is not None and _e.get("redirected") and _e.get("lemma"):
-            text ("from " + _rpydict.esc_text(_e["lemma"])) substitute False size 12 color "#88a0b8"
+        # [调试备选] 如需排查某个原型词是从哪个变形词降级来的，可取消下面两行注释（显示如: from places）：
+        # if _e is not None and _e.get("redirected") and _e.get("queried_word") and _e["queried_word"].lower() != (_e.get("word") or "").lower():
+        #     text ("from " + _rpydict.esc_text(_e["queried_word"])) substitute False size (12 + _d) color "#88a0b8"
 
-        # scrollbars None 彻底消除常驻滚动条（同时消除了滚动条把小窗撑满高度的副作用），超长内容直接手指滑动浏览
-        viewport:
-            draggable True
-            mousewheel True
-            scrollbars None
-            ymaximum 0.36
-            has vbox
-            spacing 6
+        # [EXPERIMENTAL #1 - 自适应内容高度 vs 固定高度]
+        if _scroll:
+            viewport:
+                draggable True
+                mousewheel True
+                scrollbars None
+                xfill False
+                yfill (not persistent.rpydict_auto_height)
+                ymaximum 0.36
+                has vbox
+                spacing 6
+                use rpydict_card_body(_e, _d)
+        else:
+            vbox:
+                spacing 6
+                use rpydict_card_body(_e, _d)
 
-            if _e is None:
-                text "Not in the dictionary." size 15 color "#d88888"
-            else:
-                $ _has_senses = bool(_e.get("senses"))
-                $ _has_raw = bool(_e.get("raw"))
-                $ _has_all = bool(_e.get("all_columns"))
-
-                if _has_senses:
-                    for _s in _e["senses"]:
-                        vbox:
-                            spacing 2
-                            hbox:
-                                spacing 6
-                                yalign 0.0
-                                if _s.get("pos"):
-                                    text _rpydict.esc_text(_s["pos"]) substitute False size 12 color "#78b4f0" yalign 0.15
-                                if _s.get("definition"):
-                                    text _rpydict.esc_text(_s["definition"]) substitute False size 16 color "#f2f6fa"
-                            if _s.get("example"):
-                                text _rpydict.esc_text(_s["example"]) substitute False size 13 color "#a0b0c0" italic True
-                            if _s.get("synonyms"):
-                                hbox:
-                                    box_wrap True
-                                    spacing 5
-                                    text "syn:" size 11 color "#8090a0" yalign 0.2
-                                    for _syn in _s["synonyms"]:
-                                        textbutton _rpydict.esc_btn(_syn):
-                                            action Show("rpydict_card", word=_syn)
-                                            background None
-                                            hover_background "#34507066"
-                                            padding (2, 0)
-                                            text_size 12
-                                            text_color "#98c0e8"
-                                            text_hover_color "#ffffff"
-
-                if _has_raw:
-                    for _rc, _rv in _e["raw"]:
-                        hbox:
-                            spacing 6
-                            text _rpydict.esc_text(_rc) substitute False size 12 color "#78b4f0" yalign 0.15
-                            text _rpydict.esc_text(_rv) substitute False size 15 color "#eef2f8"
-
-                if not _has_senses and not _has_raw:
-                    if _has_all:
-                        for _ac, _av in _e["all_columns"]:
-                            hbox:
-                                spacing 6
-                                text _rpydict.esc_text(_ac) substitute False size 12 color "#78b4f0" yalign 0.15
-                                text _rpydict.esc_text(_av) substitute False size 15 color "#eef2f8"
-                    else:
-                        text "No definition found." size 15 color "#d88888"
-
-        if _e is not None and _e.get("lemma") and not _e.get("redirected"):
+        # 当词条既有自身释义又有原型关联词时，展示加大加宽、好点选的 see: 跳转按钮
+        if _e is not None and _e.get("lemma"):
             textbutton ("see: " + _rpydict.esc_btn(_e["lemma"])):
-                action Show("rpydict_card", word=_e["lemma"])
-                background None
-                hover_background "#34507066"
-                padding (2, 0)
-                text_size 13
-                text_color "#78b4f0"
+                action Function(_rpydict.jump_word_in_card, _e["lemma"])
+                background "#22344acc"
+                hover_background "#345478ee"
+                padding (10, 5)
+                text_size (16 + _d)
+                text_color "#8cc4ff"
                 text_hover_color "#ffffff"
 
 
@@ -1960,23 +2256,56 @@ screen rpydict_setup():
         spacing 12
         hbox:
             xfill True
-            text "Dictionary Setup" size 24 bold True
+            text ("Dictionary Setup (" + _rpydict.MOD_VERSION + ")") substitute False size 22 bold True
             textbutton "X" action Hide("rpydict_setup") xalign 1.0 text_size 18
 
+        # 第一行：交互与位置开关
         hbox:
+            box_wrap True
+            box_wrap_spacing 8
             spacing 16
-            text "Tap word in dialogue:" size 15 color "#a0a0a0" yalign 0.5
+            text "Tap dialogue:" size 15 color "#a0a0a0" yalign 0.5
             textbutton ("ON" if persistent.rpydict_inline_mode else "OFF"):
                 action Function(_rpydict.toggle_inline_mode)
                 text_size 15
                 text_color ("#60d080" if persistent.rpydict_inline_mode else "#c07070")
                 text_hover_color "#ffffff"
-            text "Bubble pos:" size 15 color "#a0a0a0" yalign 0.5
+
+            text "Recursive tap:" size 15 color "#a0a0a0" yalign 0.5
+            textbutton ("ON" if persistent.rpydict_recursive_mode else "OFF"):
+                action Function(_rpydict.toggle_recursive_mode)
+                text_size 15
+                text_color ("#60d080" if persistent.rpydict_recursive_mode else "#c07070")
+                text_hover_color "#ffffff"
+
+            text "Position:" size 15 color "#a0a0a0" yalign 0.5
             textbutton ("Right Side" if persistent.rpydict_right_dock else "Near Word"):
                 action Function(_rpydict.toggle_right_dock)
                 text_size 15
                 text_color "#78b4f0"
                 text_hover_color "#ffffff"
+
+            text "Height:" size 15 color "#a0a0a0" yalign 0.5
+            textbutton ("Auto Fit" if persistent.rpydict_auto_height else "Fixed"):
+                action Function(_rpydict.toggle_auto_height)
+                text_size 15
+                text_color "#78b4f0"
+                text_hover_color "#ffffff"
+
+        # 第二行：字号档位与透明度档位调节（注意：在 Ren'Py 中单方括号 [...] 会触发变量插值求值，因此按钮统一用胶囊底色的 - / +）
+        hbox:
+            box_wrap True
+            box_wrap_spacing 8
+            spacing 12
+            text "Font Size:" size 15 color "#a0a0a0" yalign 0.5
+            textbutton "-" action Function(_rpydict.step_font, -1) background "#22344acc" hover_background "#345478ee" padding (10, 2) text_size 16 text_color "#78b4f0" text_hover_color "#ffffff"
+            text _rpydict.font_label() substitute False size 16 color "#ffffff" bold True yalign 0.5
+            textbutton "+" action Function(_rpydict.step_font, 1) background "#22344acc" hover_background "#345478ee" padding (10, 2) text_size 16 text_color "#78b4f0" text_hover_color "#ffffff"
+
+            text "   Opacity:" size 15 color "#a0a0a0" yalign 0.5
+            textbutton "-" action Function(_rpydict.step_alpha, -1) background "#22344acc" hover_background "#345478ee" padding (10, 2) text_size 16 text_color "#78b4f0" text_hover_color "#ffffff"
+            text _rpydict.alpha_label() substitute False size 16 color "#ffffff" bold True yalign 0.5
+            textbutton "+" action Function(_rpydict.step_alpha, 1) background "#22344acc" hover_background "#345478ee" padding (10, 2) text_size 16 text_color "#78b4f0" text_hover_color "#ffffff"
 
         if not _info["sources"]:
             text "No dictionary (.db) found.\nPut it in one of these places:" size 18 color "#c0c0c0"
